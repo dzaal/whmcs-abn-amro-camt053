@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+._*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# CAMT inbox files — never commit actual bank statements
+*.xml
+*.XML
+*.zip
