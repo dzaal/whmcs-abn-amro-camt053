@@ -1,0 +1,46 @@
+{
+    "name": "digizaal/whmcs-abn-amro-camt053",
+    "description": "WHMCS addon module that imports ABN AMRO CAMT.053 bank statements and automatically matches credit transactions to invoices.",
+    "type": "whmcs-module",
+    "version": "2.0.0",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Digizaal",
+            "email": "dirk@digizaal.nl",
+            "homepage": "https://www.digizaal.nl"
+        }
+    ],
+    "keywords": [
+        "whmcs",
+        "abn-amro",
+        "camt053",
+        "bank-import",
+        "payments",
+        "invoicing",
+        "netherlands"
+    ],
+    "homepage": "https://github.com/dzaal/whmcs-abn-amro-camt053",
+    "support": {
+        "issues": "https://github.com/dzaal/whmcs-abn-amro-camt053/issues",
+        "source": "https://github.com/dzaal/whmcs-abn-amro-camt053"
+    },
+    "require": {
+        "php": ">=8.0",
+        "ext-dom": "*",
+        "ext-zip": "*"
+    },
+    "extra": {
+        "whmcs-module-type": "addon",
+        "whmcs-module-name": "abn_camt_import",
+        "install-path": "modules/addons/abn_camt_import"
+    },
+    "archive": {
+        "exclude": [
+            "*.xml",
+            "*.zip",
+            ".DS_Store",
+            "._*"
+        ]
+    }
+}
