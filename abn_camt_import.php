@@ -93,6 +93,8 @@ function abn_camt_import_deactivate()
 
 function abn_camt_import_output($vars)
 {
+    AbnPaymentProcessor::ensureSchema();
+
     $camtFolder   = isset($vars['camt_folder']) ? rtrim(trim($vars['camt_folder']), '/') . '/' : '';
     $gateway      = trim($vars['gateway']      ?? 'banktransfer');
     $adminUser    = trim($vars['admin_user']   ?? '');
@@ -149,6 +151,13 @@ function abn_camt_import_output($vars)
                     $invoiceId  = (int) ($_POST['invoice_id']  ?? 0);
                     $invoiceNum = trim($_POST['invoice_num'] ?? '');
                     $actionResult = abn_camt_assign_payment($paymentId, $invoiceId, $invoiceNum, $adminUser, $gateway);
+                    break;
+
+                case 'assign_payment_batch':
+                    $paymentId  = (int) ($_POST['payment_id'] ?? 0);
+                    $invoiceIds = array_map('intval', (array) ($_POST['invoice_ids'] ?? []));
+                    $txAmount   = (float) ($_POST['tx_amount'] ?? 0);
+                    $actionResult = abn_camt_assign_payment_batch($paymentId, $invoiceIds, $txAmount, $adminUser, $gateway);
                     break;
 
                 case 'ignore_debtor':
@@ -463,6 +472,29 @@ function abn_camt_render_detail($processor, $fileId, $vars)
         return;
     }
 
+    // Build invoice_id → userid and userid → client name maps for linking
+    $invUserMap  = [];
+    $clientNames = [];
+    $invNumIdMap = [];
+    foreach ($payments as $p) {
+        if ($p['invoice_num'] && $p['invoice_id'] > 0) {
+            $invNumIdMap[$p['invoice_num']] = (int) $p['invoice_id'];
+        }
+    }
+    $invoiceIds = array_values(array_filter(array_unique(array_map(fn($p) => (int) $p['invoice_id'], $payments))));
+    if (!empty($invoiceIds) && class_exists('\\WHMCS\\Database\\Capsule')) {
+        $c = '\\WHMCS\\Database\\Capsule';
+        foreach ($c::table('tblinvoices')->whereIn('id', $invoiceIds)->select(['id', 'userid'])->get()->all() as $r) {
+            $invUserMap[(int) $r->id] = (int) $r->userid;
+        }
+        $userIds = array_values(array_unique(array_filter(array_values($invUserMap))));
+        if (!empty($userIds)) {
+            foreach ($c::table('tblclients')->whereIn('id', $userIds)->select(['id', 'firstname', 'lastname'])->get()->all() as $r) {
+                $clientNames[(int) $r->id] = trim($r->firstname . ' ' . $r->lastname);
+            }
+        }
+    }
+
     // Group by bank_reference so one bank transaction = one card
     $grouped = [];
     foreach ($payments as $p) {
@@ -482,10 +514,22 @@ function abn_camt_render_detail($processor, $fileId, $vars)
 
     foreach ($grouped as $group) {
         $records  = $group['records'];
-        $totalAmt = array_sum(array_map(fn($r) => (float) $r['amount'], $records));
+        $recordTxAmounts = array_filter(array_map(fn($r) => (float) ($r['tx_amount'] ?? 0), $records));
+        $totalAmt = !empty($recordTxAmounts)
+            ? max($recordTxAmounts)
+            : array_sum(array_map(fn($r) => (float) $r['amount'], $records));
         $anyPaid  = (bool) array_filter($records, fn($r) => $r['status'] === 'paid');
         $anyError = (bool) array_filter($records, fn($r) => $r['status'] === 'error' && $r['note'] !== 'manually_assigned');
         $panelCss = $anyError ? 'danger' : ($anyPaid ? 'success' : 'default');
+
+        // Resolve client for this group via any matched invoice
+        $groupUserId = 0;
+        foreach ($records as $p) {
+            if ($p['invoice_id'] > 0 && isset($invUserMap[(int) $p['invoice_id']])) {
+                $groupUserId = $invUserMap[(int) $p['invoice_id']];
+                break;
+            }
+        }
 
         echo '<div class="panel panel-' . $panelCss . '" style="margin-bottom:10px">';
 
@@ -493,12 +537,24 @@ function abn_camt_render_detail($processor, $fileId, $vars)
         echo '<div class="panel-heading" style="padding:8px 14px">';
         echo '<div style="display:flex;justify-content:space-between;align-items:center">';
         echo '<div>';
-        echo '<strong>' . htmlspecialchars($group['debtor_name'] ?: '(unknown debtor)') . '</strong>';
+        $debtorText = htmlspecialchars($group['debtor_name'] ?: '(unknown debtor)');
+        if ($groupUserId) {
+            $clientLabel = isset($clientNames[$groupUserId]) ? ' (' . htmlspecialchars($clientNames[$groupUserId]) . ')' : '';
+            echo '<strong><a href="clients.php?action=edit&id=' . $groupUserId . '" target="_blank">' . $debtorText . '</a>' . $clientLabel . '</strong>';
+        } else {
+            echo '<strong>' . $debtorText . '</strong>';
+        }
         if ($group['debtor_iban']) {
             echo ' &mdash; <code>' . htmlspecialchars($group['debtor_iban']) . '</code>';
         }
         if ($group['remittance_info']) {
-            echo '<br><small>' . htmlspecialchars($group['remittance_info']) . '</small>';
+            $remittanceHtml = preg_replace_callback('/\b(20[0-9]{2}-[0-9]{1,6})\b/', function ($m) use ($invNumIdMap) {
+                $num = $m[1];
+                return isset($invNumIdMap[$num])
+                    ? '<a href="invoices.php?action=edit&id=' . $invNumIdMap[$num] . '" target="_blank">' . htmlspecialchars($num) . '</a>'
+                    : htmlspecialchars($num);
+            }, htmlspecialchars($group['remittance_info']));
+            echo '<br><small>' . $remittanceHtml . '</small>';
         }
         echo '</div>';
         echo '<div style="text-align:right">';
@@ -515,7 +571,7 @@ function abn_camt_render_detail($processor, $fileId, $vars)
         echo '<table class="table table-condensed" style="margin:0">';
         echo '<thead><tr><th>Invoice</th><th>Amount</th><th>Status</th><th>Remark</th></tr></thead><tbody>';
 
-        $noRefRecords = [];
+        $reviewRecord = null;
         foreach ($records as $p) {
             $manuallyAssigned = ($p['status'] === 'paid' && $p['note'] === 'manually_assigned');
             $statusCss  = ['paid' => 'success', 'skipped' => 'warning', 'error' => 'danger'][$p['status']] ?? 'default';
@@ -533,19 +589,21 @@ function abn_camt_render_detail($processor, $fileId, $vars)
             echo '<td>' . htmlspecialchars($manuallyAssigned ? '' : abn_camt_format_note($p['note'])) . '</td>';
             echo '</tr>';
 
-            if ($p['note'] === 'no_invoice_ref' && $p['status'] === 'error') {
-                $noRefRecords[] = $p;
+            if ($p['status'] === 'error' && $reviewRecord === null) {
+                $reviewRecord = $p;
             }
         }
 
         echo '</tbody></table>';
 
-        // Suggestion panel for unrecognised transactions
-        foreach ($noRefRecords as $p) {
+        // Review panel for unresolved transactions
+        if ($reviewRecord) {
             $adminUser = trim($vars['admin_user'] ?? '');
-            if (!$adminUser) continue;
-            $suggestions = abn_camt_find_suggestions((float) $p['amount'], $group['debtor_name'], $group['booking_date'] ?? '');
-            abn_camt_render_suggestions($p, $fileId, $suggestions, $baseUrl, $adminUser);
+            if ($adminUser) {
+                $reviewRecord['tx_amount'] = $totalAmt;
+                $suggestions = abn_camt_find_reconciliation_candidates($reviewRecord, $group['debtor_name'], $group['booking_date'] ?? '');
+                abn_camt_render_suggestions($reviewRecord, $fileId, $suggestions, $baseUrl, $adminUser);
+            }
         }
 
         echo '</div>'; // panel
@@ -662,7 +720,11 @@ function abn_camt_tab_preview($vars, $camtFolder)
                 $transactions = $parser->parse($fullPath);
                 $matcher      = new AbnInvoiceMatcher();
                 foreach ($transactions as &$tx) {
-                    $tx['matches'] = $matcher->matchInvoices($tx['detected_invoice_numbers'], $tx['amount']);
+                    $tx['matches'] = $matcher->matchInvoices(
+                        $tx['detected_invoice_numbers'],
+                        $tx['amount'],
+                        $tx['reference_hints'] ?? []
+                    );
                 }
                 unset($tx);
             } catch (Exception $e) {
@@ -726,7 +788,7 @@ function abn_camt_tab_preview($vars, $camtFolder)
         <div class="alert alert-info">No credit (CRDT) transactions found.</div>
     <?php else: ?>
         <?php
-        $statCounts = ['exact' => 0, 'multi' => 0, 'wrong_amount' => 0, 'paid' => 0, 'not_found' => 0, 'no_number' => 0];
+        $statCounts = ['exact' => 0, 'multi' => 0, 'multi_overpay' => 0, 'overpaid' => 0, 'wrong_amount' => 0, 'paid' => 0, 'not_found' => 0, 'no_number' => 0];
         foreach ($transactions as $tx) {
             if (empty($tx['detected_invoice_numbers'])) { $statCounts['no_number']++; }
             elseif (empty($tx['matches']))              { $statCounts['not_found']++; }
@@ -736,6 +798,7 @@ function abn_camt_tab_preview($vars, $camtFolder)
         <div class="abn-summary-bar">
             <span class="abn-s-exact">&#10003; Exact: <?= $statCounts['exact'] ?></span> &nbsp;|&nbsp;
             <span class="abn-s-multi">&#8505; Multi: <?= $statCounts['multi'] ?></span> &nbsp;|&nbsp;
+            <span class="abn-s-multi">&#10133; Overpay: <?= $statCounts['multi_overpay'] + $statCounts['overpaid'] ?></span> &nbsp;|&nbsp;
             <span class="abn-s-wrong">&#9888; Wrong amount: <?= $statCounts['wrong_amount'] ?></span> &nbsp;|&nbsp;
             <span class="abn-s-notfound">&#10007; Not found: <?= $statCounts['not_found'] ?></span> &nbsp;|&nbsp;
             <span class="abn-s-paid">&#9745; Already paid: <?= $statCounts['paid'] ?></span> &nbsp;|&nbsp;
@@ -1142,41 +1205,148 @@ function abn_camt_find_suggestions($amount, $debtorName, $bookingDate = '')
     return $results;
 }
 
+function abn_camt_find_reconciliation_candidates(array $paymentRecord, $debtorName, $bookingDate = '')
+{
+    $amount = (float) ($paymentRecord['tx_amount'] ?? $paymentRecord['amount'] ?? 0);
+    $results = [];
+    $seen = [];
+    $referenceText = trim(($paymentRecord['remittance_info'] ?? '') . ' ' . ($paymentRecord['bank_reference'] ?? ''));
+    $hints = AbnCamtParser::detectInvoiceReferenceHints($referenceText);
+
+    if (class_exists('\\WHMCS\\Database\\Capsule')) {
+        $c = '\\WHMCS\\Database\\Capsule';
+        $fullNumbers = $hints['full_numbers'] ?? [];
+        $clientId = 0;
+
+        if (!empty($fullNumbers)) {
+            $rows = $c::table('tblinvoices')
+                ->select(['id', 'userid', 'invoicenum', 'total', 'status', 'date'])
+                ->whereIn('invoicenum', $fullNumbers)
+                ->get()
+                ->all();
+
+            $clientIds = array_values(array_unique(array_map(fn($r) => (int) $r->userid, $rows)));
+            if (count($clientIds) === 1) {
+                $clientId = (int) $clientIds[0];
+            }
+        }
+
+        if ($clientId > 0) {
+            $invoiceNums = $fullNumbers;
+            foreach (($hints['shorthand_groups'] ?? []) as $group) {
+                $invoiceNums[] = $group['base_year'] . '-' . ltrim((string) $group['base_number'], '0');
+                foreach ($group['numbers'] ?? [] as $num) {
+                    $invoiceNums[] = $group['base_year'] . '-' . ltrim((string) $num, '0');
+                }
+            }
+            $invoiceNums = array_values(array_unique(array_filter($invoiceNums)));
+
+            if (!empty($invoiceNums)) {
+                $rows = $c::table('tblinvoices')
+                    ->select(['id', 'userid', 'invoicenum', 'total', 'status', 'date'])
+                    ->where('userid', $clientId)
+                    ->whereIn('invoicenum', $invoiceNums)
+                    ->orderBy('date')
+                    ->orderBy('id')
+                    ->get()
+                    ->all();
+
+                $clientName = '';
+                $clientRow = $c::table('tblclients')->select(['companyname', 'firstname', 'lastname'])->where('id', $clientId)->first();
+                if ($clientRow) {
+                    $clientName = trim($clientRow->companyname ?: ($clientRow->firstname . ' ' . $clientRow->lastname));
+                }
+
+                foreach ($rows as $row) {
+                    $row = (array) $row;
+                    $diff = abs((float) $row['total'] - $amount);
+                    $results[] = [
+                        'invoice_id'      => (int) $row['id'],
+                        'invoice_num'     => $row['invoicenum'],
+                        'total'           => (float) $row['total'],
+                        'status'          => $row['status'],
+                        'date'            => $row['date'],
+                        'client_id'       => (int) $row['userid'],
+                        'client_name'     => $clientName ?: '(unknown)',
+                        'exact_amount'    => $diff < 0.02,
+                        'near_amount'     => $diff >= 0.02,
+                        'from_reference'  => true,
+                    ];
+                    $seen[(int) $row['id']] = true;
+                }
+            }
+        }
+    }
+
+    foreach (abn_camt_find_suggestions($amount, $debtorName, $bookingDate) as $candidate) {
+        if (!isset($seen[$candidate['invoice_id']])) {
+            $candidate['from_reference'] = false;
+            $results[] = $candidate;
+            $seen[$candidate['invoice_id']] = true;
+        }
+    }
+
+    usort($results, function ($a, $b) {
+        return (($a['from_reference'] ?? false) === ($b['from_reference'] ?? false))
+            ? strcmp((string) $a['date'], (string) $b['date'])
+            : (($a['from_reference'] ?? false) ? -1 : 1);
+    });
+
+    return $results;
+}
+
 /**
  * Render the suggestion panel below a no_invoice_ref error record.
  */
 function abn_camt_render_suggestions(array $paymentRecord, $fileId, array $suggestions, $baseUrl, $adminUser)
 {
     $paymentId  = (int) $paymentRecord['id'];
-    $amount     = (float) $paymentRecord['amount'];
+    $amount     = (float) ($paymentRecord['tx_amount'] ?? $paymentRecord['amount']);
     $detailUrl  = $baseUrl . '&tab=process&detail=' . $fileId;
+    $formId     = 'abn-batch-' . $paymentId;
     ?>
     <div style="background:#fffbf0;border:1px solid #f0c040;border-top:none;padding:12px 16px">
-        <strong style="font-size:.9em">&#128269; Assign this payment to an invoice</strong>
+        <strong style="font-size:.9em">&#128269; Reconcile this payment</strong>
+        <div class="text-muted" style="margin-top:4px;font-size:.87em">
+            Transaction amount: <strong>&euro;&nbsp;<?= number_format($amount, 2, ',', '.') ?></strong>
+        </div>
 
         <?php if (!empty($suggestions)): ?>
+        <form method="post" action="<?= $detailUrl ?>" id="<?= $formId ?>" style="margin:0">
+            <input type="hidden" name="abn_action" value="assign_payment_batch">
+            <input type="hidden" name="payment_id" value="<?= $paymentId ?>">
+            <input type="hidden" name="tx_amount" value="<?= htmlspecialchars(number_format($amount, 2, '.', '')) ?>">
         <table class="table table-condensed" style="margin:8px 0 6px;background:#fff;font-size:.88em">
             <thead>
                 <tr>
+                    <th></th>
                     <th>Client</th>
                     <th>Invoice</th>
                     <th class="text-right">Amount</th>
                     <th>Status</th>
                     <th>Date</th>
-                    <th></th>
+                    <th>Fit</th>
                 </tr>
             </thead>
             <tbody>
             <?php foreach ($suggestions as $s):
                 $alreadyPaid = in_array($s['status'], ['Paid', 'Refunded'], true);
-                $rowBg = $s['exact_amount'] ? 'background:#f0fff4' : ($s['near_amount'] ? 'background:#fffdf0' : '');
+                $rowBg = !empty($s['from_reference']) ? 'background:#eef9ff' : ($s['exact_amount'] ? 'background:#f0fff4' : ($s['near_amount'] ? 'background:#fffdf0' : ''));
             ?>
             <tr style="<?= $rowBg ?>">
+                <td>
+                    <?php if (!$alreadyPaid): ?>
+                    <input type="checkbox" name="invoice_ids[]" value="<?= $s['invoice_id'] ?>" data-amount="<?= htmlspecialchars(number_format($s['total'], 2, '.', '')) ?>">
+                    <?php endif; ?>
+                </td>
                 <td><?= htmlspecialchars($s['client_name']) ?></td>
                 <td>
                     <a href="invoices.php?action=edit&id=<?= $s['invoice_id'] ?>" target="_blank">
                         <?= htmlspecialchars($s['invoice_num'] ?: '#' . $s['invoice_id']) ?>
                     </a>
+                    <?php if (!empty($s['from_reference'])): ?>
+                        <span class="label label-info" style="font-size:.75em">ref</span>
+                    <?php endif; ?>
                     <?php if ($s['exact_amount']): ?>
                         <span class="label label-success" style="font-size:.75em">&#10003; exact</span>
                     <?php elseif ($s['near_amount']): ?>
@@ -1186,33 +1356,21 @@ function abn_camt_render_suggestions(array $paymentRecord, $fileId, array $sugge
                 <td class="text-right">&euro;&nbsp;<?= number_format($s['total'], 2, ',', '.') ?></td>
                 <td><span class="label label-<?= $alreadyPaid ? 'success' : ($s['status'] === 'Cancelled' ? 'warning' : 'primary') ?>"><?= htmlspecialchars($s['status']) ?></span></td>
                 <td><?= htmlspecialchars(substr($s['date'], 0, 10)) ?></td>
-                <td>
-                    <?php if ($alreadyPaid): ?>
-                    <form method="post" action="<?= $detailUrl ?>" style="margin:0">
-                        <input type="hidden" name="abn_action"  value="assign_payment">
-                        <input type="hidden" name="payment_id"  value="<?= $paymentId ?>">
-                        <input type="hidden" name="invoice_id"  value="<?= $s['invoice_id'] ?>">
-                        <button type="submit" class="btn btn-xs btn-info"
-                            onclick="return confirm('Mark this bank payment as resolved against invoice <?= htmlspecialchars(addslashes($s['invoice_num'])) ?> (<?= htmlspecialchars(addslashes($s['client_name'])) ?>)?\n\nThe invoice is already paid — no payment will be recorded and no email will be sent.')">
-                            Mark Resolved
-                        </button>
-                    </form>
-                    <?php else: ?>
-                    <form method="post" action="<?= $detailUrl ?>" style="margin:0">
-                        <input type="hidden" name="abn_action"  value="assign_payment">
-                        <input type="hidden" name="payment_id"  value="<?= $paymentId ?>">
-                        <input type="hidden" name="invoice_id"  value="<?= $s['invoice_id'] ?>">
-                        <button type="submit" class="btn btn-xs <?= $s['exact_amount'] ? 'btn-success' : 'btn-default' ?>"
-                            onclick="return confirm('Assign &amp; pay invoice <?= htmlspecialchars(addslashes($s['invoice_num'])) ?> (€<?= number_format($s['total'],2,',','.') ?>) to <?= htmlspecialchars(addslashes($s['client_name'])) ?>?\n\nThis marks the invoice as Paid and sends a confirmation email.')">
-                            Assign &amp; Pay
-                        </button>
-                    </form>
-                    <?php endif; ?>
-                </td>
+                <td><?= !empty($s['from_reference']) ? 'Mentioned in payment' : '&mdash;' ?></td>
             </tr>
             <?php endforeach; ?>
             </tbody>
         </table>
+        <div class="abn-batch-summary" data-total="<?= htmlspecialchars(number_format($amount, 2, '.', '')) ?>" style="display:flex;gap:18px;align-items:center;flex-wrap:wrap;margin:8px 0 6px">
+            <span>Selected: <strong class="abn-js-selected">&euro;&nbsp;0,00</strong></span>
+            <span>Remaining: <strong class="abn-js-remaining">&euro;&nbsp;<?= number_format($amount, 2, ',', '.') ?></strong></span>
+            <span class="text-muted">If remaining is positive, it will be added to the last selected invoice and WHMCS should book it as client credit.</span>
+        </div>
+        <button type="submit" class="btn btn-sm btn-success"
+            onclick="return confirm('Confirm the selected invoices for this payment?\n\nIf there is money left over, it will be added to the last selected invoice so WHMCS can place the excess on the client credit balance.')">
+            Confirm selected invoices
+        </button>
+        </form>
         <?php else: ?>
         <p class="text-muted" style="margin:6px 0 8px;font-size:.87em">No matching clients or invoices found automatically.</p>
         <?php endif; ?>
@@ -1417,6 +1575,131 @@ function abn_camt_assign_payment($paymentRecordId, $invoiceId, $invoiceNum, $adm
     ];
 }
 
+function abn_camt_assign_payment_batch($paymentRecordId, array $invoiceIds, $txAmount, $adminUser, $gateway)
+{
+    if (!class_exists('\\WHMCS\\Database\\Capsule')) {
+        return ['type' => 'error', 'message' => 'Database not available.'];
+    }
+
+    $invoiceIds = array_values(array_unique(array_filter(array_map('intval', $invoiceIds))));
+    if (empty($invoiceIds)) {
+        return ['type' => 'error', 'message' => 'Select at least one invoice.'];
+    }
+
+    $c = '\\WHMCS\\Database\\Capsule';
+    $pRow = $c::table('mod_abn_camt_payments')->where('id', $paymentRecordId)->first();
+    if (!$pRow) {
+        return ['type' => 'error', 'message' => 'Payment record not found.'];
+    }
+    $p = (array) $pRow;
+
+    $invoices = $c::table('tblinvoices')
+        ->select(['id', 'userid', 'invoicenum', 'total', 'status'])
+        ->whereIn('id', $invoiceIds)
+        ->orderBy('date')
+        ->orderBy('id')
+        ->get()
+        ->all();
+
+    if (count($invoices) !== count($invoiceIds)) {
+        return ['type' => 'error', 'message' => 'One or more selected invoices no longer exist.'];
+    }
+
+    $clientIds = array_values(array_unique(array_map(fn($r) => (int) $r->userid, $invoices)));
+    if (count($clientIds) !== 1) {
+        return ['type' => 'error', 'message' => 'Selected invoices must belong to the same client.'];
+    }
+
+    $sum = 0.0;
+    foreach ($invoices as $invRow) {
+        if (in_array($invRow->status, ['Paid', 'Refunded', 'Collections', 'Draft'], true)) {
+            return ['type' => 'error', 'message' => 'Selected invoices must be payable. Remove already paid, refunded, collection or draft invoices first.'];
+        }
+        $sum += (float) $invRow->total;
+    }
+    $sum = round($sum, 2);
+    $txAmount = round((float) $txAmount, 2);
+    $remaining = round($txAmount - $sum, 2);
+
+    if ($remaining < -0.014) {
+        return ['type' => 'error', 'message' => 'Selected invoices total <strong>&euro;' . number_format($sum, 2, ',', '.') . '</strong>, which is more than the payment amount <strong>&euro;' . number_format($txAmount, 2, ',', '.') . '</strong>.'];
+    }
+
+    $cleanRef = preg_replace('/[^A-Za-z0-9\-]/', '', $p['bank_reference'] ?? '');
+    $bookingDate = !empty($p['booking_date']) ? $p['booking_date'] : date('Y-m-d');
+    $created = 0;
+
+    foreach (array_values($invoices) as $idx => $invRow) {
+        $inv = (array) $invRow;
+        if ($inv['status'] === 'Cancelled') {
+            $r = localAPI('UpdateInvoice', ['invoiceid' => (int) $inv['id'], 'status' => 'Unpaid'], $adminUser);
+            if (!isset($r['result']) || $r['result'] !== 'success') {
+                return ['type' => 'error', 'message' => 'Could not reactivate cancelled invoice ' . htmlspecialchars($inv['invoicenum']) . '.'];
+            }
+        }
+
+        $payAmount = round((float) $inv['total'] + (($idx === count($invoices) - 1 && $remaining > 0.014) ? $remaining : 0.0), 2);
+        $transId = substr('ABN-' . $cleanRef . '-' . $inv['id'], 0, 255);
+        $result = localAPI('AddInvoicePayment', [
+            'invoiceid' => (int) $inv['id'],
+            'transid'   => $transId,
+            'gateway'   => $gateway,
+            'date'      => $bookingDate,
+            'amount'    => $payAmount,
+            'noemail'   => 0,
+        ], $adminUser);
+
+        if (!isset($result['result']) || $result['result'] !== 'success') {
+            return ['type' => 'error', 'message' => 'Payment API error for invoice <code>' . htmlspecialchars($inv['invoicenum']) . '</code>: ' . htmlspecialchars($result['message'] ?? 'unknown')];
+        }
+
+        $rowData = [
+            'file_id'         => (int) $p['file_id'],
+            'invoice_id'      => (int) $inv['id'],
+            'invoice_num'     => (string) $inv['invoicenum'],
+            'amount'          => $payAmount,
+            'tx_amount'       => $txAmount,
+            'currency'        => $p['currency'] ?? 'EUR',
+            'booking_date'    => $bookingDate,
+            'debtor_name'     => (string) ($p['debtor_name'] ?? ''),
+            'debtor_iban'     => (string) ($p['debtor_iban'] ?? ''),
+            'bank_reference'  => (string) ($p['bank_reference'] ?? ''),
+            'remittance_info' => (string) ($p['remittance_info'] ?? ''),
+            'trans_id'        => $transId,
+            'status'          => 'paid',
+            'note'            => ($idx === count($invoices) - 1 && $remaining > 0.014) ? 'manual_overpay:' . number_format($remaining, 2, '.', '') : 'manually_assigned',
+            'processed_at'    => date('Y-m-d H:i:s'),
+        ];
+
+        if ($idx === 0) {
+            $c::table('mod_abn_camt_payments')->where('id', $paymentRecordId)->update($rowData);
+        } else {
+            $c::table('mod_abn_camt_payments')->insert($rowData);
+        }
+        $created++;
+    }
+
+    $fileId = (int) $p['file_id'];
+    $c::table('mod_abn_camt_files')->where('id', $fileId)->update([
+        'tx_paid'  => $c::raw('tx_paid + ' . (int) $created),
+        'tx_error' => $c::raw('GREATEST(tx_error - 1, 0)'),
+    ]);
+
+    $remainingErrors = $c::table('mod_abn_camt_payments')
+        ->where('file_id', $fileId)
+        ->where('status', 'error')
+        ->count();
+    $c::table('mod_abn_camt_files')->where('id', $fileId)->update([
+        'status' => $remainingErrors === 0 ? 'processed' : 'partial',
+    ]);
+
+    $message = $remaining > 0.014
+        ? 'Invoices confirmed. The remaining <strong>&euro;' . number_format($remaining, 2, ',', '.') . '</strong> was added to the last invoice so WHMCS can place it on client credit.'
+        : 'Invoices confirmed and paid.';
+
+    return ['type' => 'assign_ok', 'message' => $message];
+}
+
 /**
  * Add a debtor to the skip_debtors module setting and mark the payment record as skipped.
  */
@@ -1504,6 +1787,9 @@ function abn_camt_format_note($note)
         'invoice_collections' => 'In collections',
         'invoice_draft'       => 'Draft invoice',
         'multi'               => 'Part of multi-invoice payment',
+        'multi_overpay'       => 'Overpayment will be booked as client credit',
+        'manual_overpay'      => 'Manual overpayment booked as client credit',
+        'overpaid'            => 'Overpayment — invoice paid, remainder added as client credit',
         'no_invoice_ref'      => 'No invoice reference — manual reconciliation needed',
     ];
     if (empty($note)) {
@@ -1581,6 +1867,8 @@ function abn_camt_render_matches(array $tx)
         switch ($m['status']) {
             case 'exact':     $css = 'abn-s-exact';    $icon = '&#10003;'; $label = 'Exact amount match'; break;
             case 'multi':     $css = 'abn-s-multi';    $icon = '&#8505;';  $label = 'Part of multi-invoice total'; break;
+            case 'multi_overpay': $css = 'abn-s-multi'; $icon = '&#10133;'; $label = 'Multi-invoice overpay (remainder to client credit)'; break;
+            case 'overpaid':  $css = 'abn-s-multi';    $icon = '&#10133;'; $label = 'Overpaid (invoice paid + remainder to client credit)'; break;
             case 'wrong_amount': $css = 'abn-s-wrong'; $icon = '&#9888;';  $label = 'Wrong amount'; break;
             case 'paid':      $css = 'abn-s-paid';     $icon = '&#9745;';  $label = 'Already paid'; break;
             case 'cancelled': $css = 'abn-s-wrong';    $icon = '&#8856;';  $label = 'Invoice is Cancelled (will be reactivated and paid)'; break;
@@ -1593,6 +1881,9 @@ function abn_camt_render_matches(array $tx)
             $num  = htmlspecialchars($inv['invoicenum'] ?: '#' . $inv['id']);
             $link = '<a href="invoices.php?action=edit&id=' . (int)$inv['id'] . '" target="_blank">Invoice ' . $num . '</a>';
             $line .= ' &mdash; ' . $link . ' &mdash; EUR&nbsp;' . number_format((float)$inv['total'], 2) . ' &mdash; ' . htmlspecialchars($inv['status']);
+            if (isset($m['pay_amount']) && abs((float) $m['pay_amount'] - (float) $inv['total']) > 0.014) {
+                $line .= ' &mdash; pays EUR&nbsp;' . number_format((float) $m['pay_amount'], 2);
+            }
         } elseif (isset($m['number'])) {
             $line .= ' &mdash; <code>' . htmlspecialchars($m['number']) . '</code>';
         }
@@ -1645,4 +1936,27 @@ function abn_camt_styles()
 .abn-s-notfound{color:#b92b2b;font-weight:700}
 </style>
 CSS;
+    echo <<<'JS'
+<script>
+document.addEventListener('change', function (event) {
+  if (!event.target.matches('input[name="invoice_ids[]"]')) return;
+  var form = event.target.form;
+  if (!form) return;
+  var summary = form.querySelector('.abn-batch-summary');
+  if (!summary) return;
+  var total = parseFloat(summary.getAttribute('data-total') || '0');
+  var selected = 0;
+  form.querySelectorAll('input[name="invoice_ids[]"]:checked').forEach(function (cb) {
+    selected += parseFloat(cb.getAttribute('data-amount') || '0');
+  });
+  var remaining = total - selected;
+  var format = function (value) {
+    return '&euro;&nbsp;' + value.toFixed(2).replace('.', ',');
+  };
+  summary.querySelector('.abn-js-selected').innerHTML = format(selected);
+  summary.querySelector('.abn-js-remaining').innerHTML = format(remaining);
+  summary.querySelector('.abn-js-remaining').style.color = remaining < -0.014 ? '#b92b2b' : '#1c7a3c';
+});
+</script>
+JS;
 }

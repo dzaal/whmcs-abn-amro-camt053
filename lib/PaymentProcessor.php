@@ -96,7 +96,11 @@ class AbnPaymentProcessor
                 continue;
             }
 
-            $matches = $matcher->matchInvoices($tx['detected_invoice_numbers'], $tx['amount']);
+            $matches = $matcher->matchInvoices(
+                $tx['detected_invoice_numbers'],
+                $tx['amount'],
+                $tx['reference_hints'] ?? []
+            );
 
             if (empty($matches)) {
                 // No invoice number detected — log as error so it appears in the
@@ -110,7 +114,7 @@ class AbnPaymentProcessor
             $txError = 0;
 
             foreach ($matches as $match) {
-                if ($match['status'] === 'exact' || $match['status'] === 'multi') {
+                if (in_array($match['status'], ['exact', 'multi', 'multi_overpay', 'overpaid'], true)) {
                     $result = $this->payInvoice($match, $tx, $fileId);
                 } else {
                     // wrong_amount / already paid / not_found — log and skip
@@ -247,8 +251,11 @@ class AbnPaymentProcessor
             }
         }
 
-        // For multi-match each invoice is paid at its own total; for exact use tx amount
-        $payAmount = ($match['status'] === 'multi') ? (float) $inv['total'] : (float) $tx['amount'];
+        // For multi-match each invoice is paid at its own total. Overpayment is
+        // added to the final selected invoice so WHMCS books the remainder as credit.
+        $payAmount = isset($match['pay_amount'])
+            ? (float) $match['pay_amount']
+            : (in_array($match['status'], ['multi', 'overpaid'], true) ? (float) $inv['total'] : (float) $tx['amount']);
 
         // Unique transaction ID: bank ref + invoice id
         $cleanRef = preg_replace('/[^A-Za-z0-9\-]/', '', $tx['bank_reference']);
@@ -267,7 +274,19 @@ class AbnPaymentProcessor
             $result = localAPI('AddInvoicePayment', $apiParams, $this->adminUser);
 
             if (isset($result['result']) && $result['result'] === 'success') {
-                return $this->logPaymentRow($fileId, $inv, $payAmount, $tx, $transId, 'paid', '');
+                if ($match['status'] === 'overpaid' && !empty($match['overpay'])) {
+                    $overpay     = round((float) $match['overpay'], 2);
+                    $creditResult = localAPI('AddCredit', [
+                        'clientid'    => (int) $inv['userid'],
+                        'amount'      => $overpay,
+                        'description' => 'Overpayment on invoice ' . ($inv['invoicenum'] ?: '#' . $inv['id']),
+                    ], $this->adminUser);
+                    $creditOk = isset($creditResult['result']) && $creditResult['result'] === 'success';
+                    $note = 'overpaid:' . number_format($overpay, 2, '.', '') . ($creditOk ? '' : ':credit_failed');
+                } else {
+                    $note = !empty($match['overpay']) ? 'multi_overpay:' . number_format((float) $match['overpay'], 2, '.', '') : '';
+                }
+                return $this->logPaymentRow($fileId, $inv, $payAmount, $tx, $transId, 'paid', $note);
             }
 
             $errMsg = $result['message'] ?? 'API returned non-success';
@@ -349,6 +368,7 @@ class AbnPaymentProcessor
             'invoice_id'      => $invId,
             'invoice_num'     => substr((string) ($inv['invoicenum'] ?? ''), 0, 50),
             'amount'          => round((float) $amount, 2),
+            'tx_amount'       => round((float) ($tx['amount'] ?? 0), 2),
             'currency'        => $tx['currency'] ?? 'EUR',
             'booking_date'    => $tx['booking_date'] ?: null,
             'debtor_name'     => substr($tx['debtor_name'] ?? '', 0, 255),
@@ -399,6 +419,7 @@ class AbnPaymentProcessor
                 `invoice_id` int(11) NOT NULL DEFAULT 0,
                 `invoice_num` varchar(50) NOT NULL DEFAULT '',
                 `amount` decimal(10,2) NOT NULL DEFAULT 0.00,
+                `tx_amount` decimal(10,2) NOT NULL DEFAULT 0.00,
                 `currency` varchar(3) NOT NULL DEFAULT 'EUR',
                 `booking_date` date DEFAULT NULL,
                 `debtor_name` varchar(255) NOT NULL DEFAULT '',
@@ -441,6 +462,7 @@ class AbnPaymentProcessor
                 $t->integer('invoice_id')->default(0);
                 $t->string('invoice_num', 50)->default('');
                 $t->decimal('amount', 10, 2)->default(0);
+                $t->decimal('tx_amount', 10, 2)->default(0);
                 $t->string('currency', 3)->default('EUR');
                 $t->date('booking_date')->nullable();
                 $t->string('debtor_name', 255)->default('');
@@ -467,6 +489,24 @@ class AbnPaymentProcessor
     }
 
     // =========================================================================
+
+    public static function ensureSchema()
+    {
+        if (!class_exists('\\WHMCS\\Database\\Capsule')) {
+            return;
+        }
+
+        $c = '\\WHMCS\\Database\\Capsule';
+        if (!$c::schema()->hasTable('mod_abn_camt_payments')) {
+            return;
+        }
+
+        if (!$c::schema()->hasColumn('mod_abn_camt_payments', 'tx_amount')) {
+            $c::schema()->table('mod_abn_camt_payments', function ($t) {
+                $t->decimal('tx_amount', 10, 2)->default(0)->after('amount');
+            });
+        }
+    }
 
     private function isSkippedDebtor($debtorName)
     {

@@ -31,9 +31,11 @@ class AbnInvoiceMatcher
      * @param  float    $txAmount
      * @return array[]
      */
-    public function matchInvoices(array $invoiceNumbers, $txAmount)
+    public function matchInvoices(array $invoiceNumbers, $txAmount, array $referenceHints = [])
     {
-        if (empty($invoiceNumbers)) {
+        $invoiceNumbers = array_values(array_unique(array_filter(array_map('trim', $invoiceNumbers))));
+
+        if (empty($invoiceNumbers) && empty($referenceHints['shorthand_groups'])) {
             return [];
         }
 
@@ -43,11 +45,20 @@ class AbnInvoiceMatcher
         foreach ($invoiceNumbers as $num) {
             $invoice = $this->findInvoice($num);
             if ($invoice) {
-                $found[] = ['number' => $num, 'invoice' => $invoice];
+                $found[$invoice['id']] = ['number' => $num, 'invoice' => $invoice];
             } else {
                 $notFound[] = $num;
             }
         }
+
+        $expanded = $this->expandShorthandMatches(array_values($found), $referenceHints);
+        foreach ($expanded['found'] as $fi) {
+            $found[$fi['invoice']['id']] = $fi;
+        }
+        foreach ($expanded['not_found'] as $num) {
+            $notFound[] = $num;
+        }
+        $notFound = array_values(array_unique($notFound));
 
         $results = [];
 
@@ -59,8 +70,21 @@ class AbnInvoiceMatcher
             return $results;
         }
 
+        $found = array_values($found);
+
         if (count($found) === 1) {
             $results[] = $this->classifySingle($found[0]['invoice'], $txAmount);
+            return $results;
+        }
+
+        $clientIds = array_values(array_unique(array_map(function ($fi) {
+            return (int) ($fi['invoice']['userid'] ?? 0);
+        }, $found)));
+
+        if (count(array_filter($clientIds)) > 1) {
+            foreach ($found as $fi) {
+                $results[] = ['status' => 'wrong_amount', 'invoice' => $fi['invoice'], 'note' => 'mixed_clients'];
+            }
             return $results;
         }
 
@@ -69,13 +93,31 @@ class AbnInvoiceMatcher
             return (float) $fi['invoice']['total'];
         }, $found));
         $totalMatches = abs($combinedTotal - $txAmount) < 0.015;
+        $overpay = round((float) $txAmount - $combinedTotal, 2);
+        $allPayable = !array_filter($found, function ($fi) {
+            return $this->isNonPayable($fi['invoice']['status']);
+        });
+
+        if ($allPayable && $overpay > 0.014) {
+            $lastIndex = count($found) - 1;
+            foreach ($found as $idx => $fi) {
+                $inv = $fi['invoice'];
+                $results[] = [
+                    'status'     => 'multi_overpay',
+                    'invoice'    => $inv,
+                    'pay_amount' => round((float) $inv['total'] + ($idx === $lastIndex ? $overpay : 0.0), 2),
+                    'overpay'    => $idx === $lastIndex ? $overpay : 0.0,
+                ];
+            }
+            return $results;
+        }
 
         foreach ($found as $fi) {
             $inv = $fi['invoice'];
             if ($this->isNonPayable($inv['status'])) {
                 $results[] = ['status' => 'paid', 'invoice' => $inv];
             } elseif ($totalMatches) {
-                $results[] = ['status' => 'multi', 'invoice' => $inv];
+                $results[] = ['status' => 'multi', 'invoice' => $inv, 'pay_amount' => (float) $inv['total']];
             } else {
                 $results[] = ['status' => 'wrong_amount', 'invoice' => $inv];
             }
@@ -93,6 +135,9 @@ class AbnInvoiceMatcher
         }
         if (abs((float) $inv['total'] - $txAmount) < 0.015) {
             return ['status' => 'exact', 'invoice' => $inv];
+        }
+        if ((float) $txAmount > (float) $inv['total'] + 0.014) {
+            return ['status' => 'overpaid', 'invoice' => $inv, 'overpay' => round((float) $txAmount - (float) $inv['total'], 2)];
         }
         return ['status' => 'wrong_amount', 'invoice' => $inv];
     }
@@ -131,7 +176,7 @@ class AbnInvoiceMatcher
         // 1. Exact invoicenum match ("2026-407")
         try {
             $row = $capsule::table('tblinvoices')
-                ->select(['id', 'invoicenum', 'total', 'status', 'date'])
+                ->select(['id', 'userid', 'invoicenum', 'total', 'status', 'date'])
                 ->where('invoicenum', $invoiceNumber)
                 ->first();
 
@@ -150,7 +195,7 @@ class AbnInvoiceMatcher
 
         try {
             $row = $capsule::table('tblinvoices')
-                ->select(['id', 'invoicenum', 'total', 'status', 'date'])
+                ->select(['id', 'userid', 'invoicenum', 'total', 'status', 'date'])
                 ->where('id', $numericId)
                 ->first();
 
@@ -165,7 +210,7 @@ class AbnInvoiceMatcher
         // 1. Try invoicenum match
         if (function_exists('full_query')) {
             $esc = mysql_real_escape_string($invoiceNumber);
-            $res = full_query("SELECT id, invoicenum, total, status, date FROM tblinvoices WHERE invoicenum = '{$esc}' LIMIT 1");
+            $res = full_query("SELECT id, userid, invoicenum, total, status, date FROM tblinvoices WHERE invoicenum = '{$esc}' LIMIT 1");
             if ($res && ($row = mysql_fetch_assoc($res))) {
                 return $this->normalise($row);
             }
@@ -178,7 +223,7 @@ class AbnInvoiceMatcher
         }
 
         if (function_exists('full_query')) {
-            $res = full_query("SELECT id, invoicenum, total, status, date FROM tblinvoices WHERE id = " . (int) $numericId . " LIMIT 1");
+            $res = full_query("SELECT id, userid, invoicenum, total, status, date FROM tblinvoices WHERE id = " . (int) $numericId . " LIMIT 1");
             if ($res && ($row = mysql_fetch_assoc($res))) {
                 return $this->normalise($row);
             }
@@ -209,7 +254,73 @@ class AbnInvoiceMatcher
             'total'      => (float) ($row['total']       ?? 0),
             'status'     =>          $row['status']      ?? '',
             'date'       =>          $row['date']        ?? '',
+            'userid'     => (int)   ($row['userid']      ?? 0),
             'currency'   => 'EUR',
         ];
+    }
+
+    private function expandShorthandMatches(array $found, array $referenceHints)
+    {
+        $result = ['found' => [], 'not_found' => []];
+
+        if (empty($referenceHints['shorthand_groups']) || !$this->useCapsule || empty($found)) {
+            return $result;
+        }
+
+        $clientIds = array_values(array_unique(array_map(function ($fi) {
+            return (int) ($fi['invoice']['userid'] ?? 0);
+        }, $found)));
+
+        if (count(array_filter($clientIds)) !== 1) {
+            return $result;
+        }
+
+        $clientId = (int) $clientIds[0];
+        $capsule = '\\WHMCS\\Database\\Capsule';
+        $knownIds = [];
+        foreach ($found as $fi) {
+            $knownIds[(int) $fi['invoice']['id']] = true;
+        }
+
+        foreach ($referenceHints['shorthand_groups'] as $group) {
+            $numbers = array_values(array_unique(array_filter(array_merge(
+                [(string) $group['base_number']],
+                $group['numbers'] ?? []
+            ))));
+            $invoiceNums = array_map(function ($n) use ($group) {
+                return $group['base_year'] . '-' . ltrim((string) $n, '0');
+            }, $numbers);
+
+            try {
+                $rows = $capsule::table('tblinvoices')
+                    ->select(['id', 'userid', 'invoicenum', 'total', 'status', 'date'])
+                    ->where('userid', $clientId)
+                    ->whereIn('invoicenum', $invoiceNums)
+                    ->get()
+                    ->all();
+            } catch (Exception $e) {
+                return $result;
+            }
+
+            $byNum = [];
+            foreach ($rows as $row) {
+                $inv = $this->normalise($row);
+                $byNum[$inv['invoicenum']] = $inv;
+            }
+
+            foreach ($invoiceNums as $invoiceNum) {
+                if (isset($byNum[$invoiceNum])) {
+                    $inv = $byNum[$invoiceNum];
+                    if (!isset($knownIds[$inv['id']])) {
+                        $result['found'][] = ['number' => $invoiceNum, 'invoice' => $inv];
+                        $knownIds[$inv['id']] = true;
+                    }
+                } else {
+                    $result['not_found'][] = $invoiceNum;
+                }
+            }
+        }
+
+        return $result;
     }
 }
