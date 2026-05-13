@@ -133,14 +133,16 @@ class AbnCamtParser
                 }
             }
 
-            // Also scan entry-level AddtlNtryInf — ABN AMRO puts /REMI/... here
-            if ($addtlNtryInf) {
+            // Scan entry-level AddtlNtryInf only as a fallback when no remittance
+            // text was found in TxDtls — prevents false positives from ABN AMRO
+            // internal references (e.g. /TRCD/160/ matching as invoice 2026-160).
+            if ($addtlNtryInf && empty($searchTexts)) {
                 $searchTexts[] = $addtlNtryInf;
             }
 
-            // Detect invoice numbers from all collected text
-            $allText         = implode(' ', array_unique($searchTexts));
-            $detectedNumbers = $this->detectInvoiceNumbers($allText);
+            // Detect invoice references from all collected text.
+            $allText        = implode(' ', array_unique($searchTexts));
+            $referenceHints = self::detectInvoiceReferenceHints($allText);
 
             $transactions[] = [
                 'booking_date'             => $this->normaliseDate($bookDate),
@@ -150,7 +152,8 @@ class AbnCamtParser
                 'debtor_iban'              => trim($debtorIban),
                 'remittance_info'          => trim($remittance),
                 'bank_reference'           => trim($bankRef),
-                'detected_invoice_numbers' => $detectedNumbers,
+                'detected_invoice_numbers' => $referenceHints['full_numbers'],
+                'reference_hints'          => $referenceHints,
             ];
         }
 
@@ -159,17 +162,45 @@ class AbnCamtParser
 
     // -------------------------------------------------------------------------
 
-    private function detectInvoiceNumbers($text)
+    public static function detectInvoiceReferenceHints($text)
     {
+        $result = [
+            'full_numbers'     => [],
+            'shorthand_groups' => [],
+        ];
+
         if (empty($text)) {
-            return [];
+            return $result;
         }
+
         // Optional single-letter prefix (e.g. F2026-197 → 2026-197).
         // Capture group 1 is the normalised 20YY-NNN part without any prefix.
-        if (!preg_match_all('/\b[A-Z]?(20[0-9]{2}-[0-9]{1,6})\b/i', $text, $m)) {
-            return [];
+        if (preg_match_all('/\b[A-Z]?(20[0-9]{2}-[0-9]{1,6})\b/i', $text, $m)) {
+            $result['full_numbers'] = array_values(array_unique($m[1]));
         }
-        return array_values(array_unique($m[1]));
+
+        // Support compact lists like "2026-69 87 41 42" where the first invoice
+        // carries the year prefix and the following items only contain the suffix.
+        if (preg_match_all('/\b[A-Z]?(20[0-9]{2})-([0-9]{1,6})\b((?:[\s,;\/+.]+[0-9]{1,6}){1,60})/i', $text, $groups, PREG_SET_ORDER)) {
+            foreach ($groups as $group) {
+                preg_match_all('/[0-9]{1,6}/', $group[3], $tailMatches);
+                $tailNumbers = array_values(array_filter(array_unique($tailMatches[0] ?? []), static function ($n) use ($group) {
+                    return $n !== '' && $n !== $group[1];
+                }));
+
+                if (empty($tailNumbers)) {
+                    continue;
+                }
+
+                $result['shorthand_groups'][] = [
+                    'base_year'   => $group[1],
+                    'base_number' => $group[2],
+                    'numbers'     => $tailNumbers,
+                ];
+            }
+        }
+
+        return $result;
     }
 
     private function normaliseDate($raw)
