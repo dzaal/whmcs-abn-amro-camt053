@@ -13,6 +13,7 @@ if (!defined('WHMCS')) {
 
 require_once __DIR__ . '/lib/CamtParser.php';
 require_once __DIR__ . '/lib/InvoiceMatcher.php';
+require_once __DIR__ . '/lib/DomainRenewalUpdater.php';
 require_once __DIR__ . '/lib/PaymentProcessor.php';
 
 add_hook('CronJob', 1, function ($vars) {

@@ -216,14 +216,14 @@ class AbnCamtParser
     // DOM helpers
     // -------------------------------------------------------------------------
 
-    private function query($expr, DOMNode $ctx = null)
+    private function query($expr, ?DOMNode $ctx = null)
     {
         return $ctx
             ? $this->xpath->query($expr, $ctx)
             : $this->xpath->query($expr);
     }
 
-    private function val($expr, DOMNode $ctx = null)
+    private function val($expr, ?DOMNode $ctx = null)
     {
         $nodes = $this->query($expr, $ctx);
         if ($nodes && $nodes->length > 0) {

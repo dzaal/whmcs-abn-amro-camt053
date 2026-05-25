@@ -8,6 +8,7 @@ A WHMCS addon module that automatically imports ABN AMRO CAMT.053 bank statement
 - Detects invoice numbers from remittance info (e.g. `Factuur 2025-308`, `F2026-197`)
 - Matches transactions to WHMCS invoices by invoice number or numeric ID
 - Marks matched unpaid invoices as **Paid** via WHMCS API and sends confirmation emails
+- Advances WHMCS domain renewal dates for paid domain invoices, so upcoming-domain reminders do not fire after payment
 - Handles multi-invoice payments (e.g. one bank transfer covering several invoices)
 - Reactivates **Cancelled** invoices before processing payment
 - Auto-processes new files on every WHMCS cron run
@@ -80,6 +81,7 @@ A single optional letter prefix is stripped automatically, so `F2026-197` is det
 |---|---|
 | Single invoice, amount matches exactly | Marked **Paid**, email sent |
 | Multiple invoices, combined total matches | All marked **Paid**, emails sent |
+| Paid domain renewal invoice | Related `tbldomains` renewal dates are advanced to the next period |
 | Invoice already Paid / Refunded | **Skipped** |
 | Amount does not match | **Skipped** (wrong_amount) |
 | Invoice was Cancelled | Reactivated to Unpaid, then marked Paid |

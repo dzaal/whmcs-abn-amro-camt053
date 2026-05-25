@@ -16,6 +16,8 @@ if (!defined('WHMCS')) {
     die('This file cannot be accessed directly');
 }
 
+require_once __DIR__ . '/DomainRenewalUpdater.php';
+
 class AbnPaymentProcessor
 {
     /** @var string  WHMCS gateway module name, e.g. "banktransfer" */
@@ -274,6 +276,8 @@ class AbnPaymentProcessor
             $result = localAPI('AddInvoicePayment', $apiParams, $this->adminUser);
 
             if (isset($result['result']) && $result['result'] === 'success') {
+                $domainSync = AbnDomainRenewalUpdater::syncPaidInvoice((int) $inv['id']);
+
                 if ($match['status'] === 'overpaid' && !empty($match['overpay'])) {
                     $overpay     = round((float) $match['overpay'], 2);
                     $creditResult = localAPI('AddCredit', [
@@ -285,6 +289,9 @@ class AbnPaymentProcessor
                     $note = 'overpaid:' . number_format($overpay, 2, '.', '') . ($creditOk ? '' : ':credit_failed');
                 } else {
                     $note = !empty($match['overpay']) ? 'multi_overpay:' . number_format((float) $match['overpay'], 2, '.', '') : '';
+                }
+                if (!empty($domainSync['updated'])) {
+                    $note = trim($note . ($note !== '' ? ';' : '') . 'domain_dates_advanced:' . (int) $domainSync['updated'], ';');
                 }
                 return $this->logPaymentRow($fileId, $inv, $payAmount, $tx, $transId, 'paid', $note);
             }

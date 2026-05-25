@@ -20,6 +20,7 @@ if (!defined('WHMCS')) {
 
 require_once __DIR__ . '/lib/CamtParser.php';
 require_once __DIR__ . '/lib/InvoiceMatcher.php';
+require_once __DIR__ . '/lib/DomainRenewalUpdater.php';
 require_once __DIR__ . '/lib/PaymentProcessor.php';
 
 // =============================================================================
@@ -482,6 +483,7 @@ function abn_camt_render_detail($processor, $fileId, $vars)
         }
     }
     $invoiceIds = array_values(array_filter(array_unique(array_map(fn($p) => (int) $p['invoice_id'], $payments))));
+    $domainUpdateMap = abn_camt_domain_update_map($payments);
     if (!empty($invoiceIds) && class_exists('\\WHMCS\\Database\\Capsule')) {
         $c = '\\WHMCS\\Database\\Capsule';
         foreach ($c::table('tblinvoices')->whereIn('id', $invoiceIds)->select(['id', 'userid'])->get()->all() as $r) {
@@ -573,7 +575,8 @@ function abn_camt_render_detail($processor, $fileId, $vars)
 
         $reviewRecord = null;
         foreach ($records as $p) {
-            $manuallyAssigned = ($p['status'] === 'paid' && $p['note'] === 'manually_assigned');
+            $note = (string) ($p['note'] ?? '');
+            $manuallyAssigned = ($p['status'] === 'paid' && strpos($note, 'manually_assigned') !== false);
             $statusCss  = ['paid' => 'success', 'skipped' => 'warning', 'error' => 'danger'][$p['status']] ?? 'default';
             $statusLabel = $manuallyAssigned ? 'Manually assigned' : $p['status'];
             $invLink   = $p['invoice_id']
@@ -586,7 +589,7 @@ function abn_camt_render_detail($processor, $fileId, $vars)
             echo '<td>' . $invLink . '</td>';
             echo '<td>' . ($amt > 0 ? '&euro;&nbsp;' . number_format($amt, 2, ',', '.') : '<span class="text-muted">—</span>') . '</td>';
             echo '<td><span class="label label-' . $statusCss . '">' . htmlspecialchars($statusLabel) . '</span></td>';
-            echo '<td>' . htmlspecialchars($manuallyAssigned ? '' : abn_camt_format_note($p['note'])) . '</td>';
+            echo '<td>' . abn_camt_render_payment_note($note, (int) $p['invoice_id'], $domainUpdateMap) . '</td>';
             echo '</tr>';
 
             if ($p['status'] === 'error' && $reviewRecord === null) {
@@ -608,6 +611,75 @@ function abn_camt_render_detail($processor, $fileId, $vars)
 
         echo '</div>'; // panel
     }
+}
+
+function abn_camt_domain_update_map(array $payments)
+{
+    if (!class_exists('\\WHMCS\\Database\\Capsule')) {
+        return [];
+    }
+
+    $invoiceIds = [];
+    foreach ($payments as $p) {
+        if (!empty($p['invoice_id']) && strpos((string) ($p['note'] ?? ''), 'domain_dates_advanced') !== false) {
+            $invoiceIds[] = (int) $p['invoice_id'];
+        }
+    }
+    $invoiceIds = array_values(array_unique(array_filter($invoiceIds)));
+    if (!$invoiceIds) {
+        return [];
+    }
+
+    $c = '\\WHMCS\\Database\\Capsule';
+    $rows = $c::table('tblinvoiceitems as ii')
+        ->join('tbldomains as d', 'd.id', '=', 'ii.relid')
+        ->whereIn('ii.invoiceid', $invoiceIds)
+        ->where('ii.type', 'Domain')
+        ->select([
+            'ii.invoiceid',
+            'd.domain',
+            'd.expirydate',
+            'd.nextduedate',
+            'd.nextinvoicedate',
+        ])
+        ->orderBy('d.domain')
+        ->get();
+
+    $map = [];
+    foreach ($rows as $row) {
+        $invoiceId = (int) $row->invoiceid;
+        if (!isset($map[$invoiceId])) {
+            $map[$invoiceId] = [];
+        }
+        $map[$invoiceId][] = [
+            'domain' => $row->domain,
+            'expirydate' => $row->expirydate,
+            'nextduedate' => $row->nextduedate,
+            'nextinvoicedate' => $row->nextinvoicedate,
+        ];
+    }
+    return $map;
+}
+
+function abn_camt_render_payment_note($note, $invoiceId, array $domainUpdateMap)
+{
+    $text = abn_camt_format_note($note);
+    $html = $text === '—' ? '<span class="text-muted">—</span>' : htmlspecialchars($text);
+
+    if (strpos((string) $note, 'domain_dates_advanced') === false || empty($domainUpdateMap[$invoiceId])) {
+        return $html;
+    }
+
+    foreach ($domainUpdateMap[$invoiceId] as $domain) {
+        $html .= '<div class="text-success" style="font-size:.9em;margin-top:3px">';
+        $html .= '&#10003; Domain dates updated: <strong>' . htmlspecialchars($domain['domain']) . '</strong>';
+        $html .= ' &mdash; expiry ' . htmlspecialchars($domain['expirydate']);
+        $html .= ', next due ' . htmlspecialchars($domain['nextduedate']);
+        $html .= ', next invoice ' . htmlspecialchars($domain['nextinvoicedate']);
+        $html .= '</div>';
+    }
+
+    return $html;
 }
 
 // =============================================================================
@@ -1496,13 +1568,15 @@ function abn_camt_assign_payment($paymentRecordId, $invoiceId, $invoiceNum, $adm
     $alreadyPaid = in_array($inv['status'], ['Paid', 'Refunded'], true);
 
     if ($alreadyPaid) {
+        $domainSync = AbnDomainRenewalUpdater::syncPaidInvoice((int) $inv['id'], 'ABN CAMT Import manual assignment');
+
         // Invoice is already paid — just link the bank payment record to it without
         // calling AddInvoicePayment again (that would create a duplicate payment).
         $c::table('mod_abn_camt_payments')->where('id', $paymentRecordId)->update([
             'invoice_id'  => (int) $inv['id'],
             'invoice_num' => (string) $inv['invoicenum'],
             'status'      => 'paid',
-            'note'        => 'manually_assigned',
+            'note'        => 'manually_assigned' . (!empty($domainSync['updated']) ? ';domain_dates_advanced:' . (int) $domainSync['updated'] : ''),
         ]);
 
         // Fix file stats
@@ -1548,12 +1622,14 @@ function abn_camt_assign_payment($paymentRecordId, $invoiceId, $invoiceNum, $adm
         return ['type' => 'error', 'message' => 'Payment API error: ' . ($result['message'] ?? 'unknown')];
     }
 
+    $domainSync = AbnDomainRenewalUpdater::syncPaidInvoice((int) $inv['id'], 'ABN CAMT Import manual assignment');
+
     // Update payment record to paid
     $c::table('mod_abn_camt_payments')->where('id', $paymentRecordId)->update([
         'invoice_id'  => (int) $inv['id'],
         'invoice_num' => (string) $inv['invoicenum'],
         'status'      => 'paid',
-        'note'        => '',
+        'note'        => !empty($domainSync['updated']) ? 'domain_dates_advanced:' . (int) $domainSync['updated'] : '',
     ]);
 
     // Fix file stats: -1 error, +1 paid; set status to processed if errors now 0
@@ -1653,6 +1729,12 @@ function abn_camt_assign_payment_batch($paymentRecordId, array $invoiceIds, $txA
             return ['type' => 'error', 'message' => 'Payment API error for invoice <code>' . htmlspecialchars($inv['invoicenum']) . '</code>: ' . htmlspecialchars($result['message'] ?? 'unknown')];
         }
 
+        $domainSync = AbnDomainRenewalUpdater::syncPaidInvoice((int) $inv['id'], 'ABN CAMT Import batch manual assignment');
+        $note = ($idx === count($invoices) - 1 && $remaining > 0.014) ? 'manual_overpay:' . number_format($remaining, 2, '.', '') : 'manually_assigned';
+        if (!empty($domainSync['updated'])) {
+            $note .= ';domain_dates_advanced:' . (int) $domainSync['updated'];
+        }
+
         $rowData = [
             'file_id'         => (int) $p['file_id'],
             'invoice_id'      => (int) $inv['id'],
@@ -1667,7 +1749,7 @@ function abn_camt_assign_payment_batch($paymentRecordId, array $invoiceIds, $txA
             'remittance_info' => (string) ($p['remittance_info'] ?? ''),
             'trans_id'        => $transId,
             'status'          => 'paid',
-            'note'            => ($idx === count($invoices) - 1 && $remaining > 0.014) ? 'manual_overpay:' . number_format($remaining, 2, '.', '') : 'manually_assigned',
+            'note'            => $note,
             'processed_at'    => date('Y-m-d H:i:s'),
         ];
 
@@ -1791,13 +1873,25 @@ function abn_camt_format_note($note)
         'manual_overpay'      => 'Manual overpayment booked as client credit',
         'overpaid'            => 'Overpayment — invoice paid, remainder added as client credit',
         'no_invoice_ref'      => 'No invoice reference — manual reconciliation needed',
+        'manually_assigned'   => 'Manually assigned',
+        'domain_dates_advanced' => 'Domain renewal dates advanced',
     ];
     if (empty($note)) {
         return '—';
     }
-    $parts = explode(':', $note, 2);
-    $label = $map[$parts[0]] ?? $parts[0];
-    return isset($parts[1]) ? $label . ' — ' . $parts[1] : $label;
+
+    $labels = [];
+    foreach (explode(';', $note) as $notePart) {
+        $notePart = trim($notePart);
+        if ($notePart === '') {
+            continue;
+        }
+        $parts = explode(':', $notePart, 2);
+        $label = $map[$parts[0]] ?? $parts[0];
+        $labels[] = isset($parts[1]) ? $label . ' — ' . $parts[1] : $label;
+    }
+
+    return $labels ? implode('; ', $labels) : '—';
 }
 
 /**
